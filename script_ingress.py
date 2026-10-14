@@ -8,7 +8,7 @@ from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 # 1. Target repositories
 REPOSITORIES = [
     # Add here the repos to modify...
-    #{"name": "pagopa/pagopa-anonymizer", "domain": "shared"},
+    #{"name": "pagopa/pagopa-anonymizer", "domain": "shared"}
 ]
 
 BRANCH_NAME = "update-ingress-haproxy"
@@ -157,73 +157,95 @@ def process_repository(gh, repo_name, domain, pr_elaborated):
 
     default_branch = repo.default_branch
 
+    # 1. Check/Create the dedicated branch
+    branch_exists = False
     try:
-        helm_contents = repo.get_contents("helm")
+        repo.get_git_ref(f"heads/{BRANCH_NAME}")
+        branch_exists = True
+        print(f"The branch '{BRANCH_NAME}' already exists. It will be checked and possibly updated.")
     except GithubException:
-        print(f"WARN: Folder 'helm/' not found in {repo_name}. Skip.")
+        source_ref = repo.get_git_ref(f"heads/{default_branch}")
+        repo.create_git_ref(ref=f"refs/heads/{BRANCH_NAME}", sha=source_ref.object.sha)
+        print(f"Branch '{BRANCH_NAME}' created successfully.")
+
+    # 2. Retrieve YAML files in the helm/ folder from the target branch (if it exists) or from the main branch
+    target_ref = BRANCH_NAME if branch_exists else default_branch
+    
+    try:
+        helm_contents = repo.get_contents("helm", ref=target_ref)
+    except GithubException:
+        print(f"WARN: Folder 'helm/' not found in {repo_name}. Skipping.")
         return
 
     files_to_process = []
     while helm_contents:
         file_content = helm_contents.pop(0)
         if file_content.type == "dir":
-            helm_contents.extend(repo.get_contents(file_content.path))
+            helm_contents.extend(repo.get_contents(file_content.path, ref=target_ref))
         elif file_content.name.endswith((".yaml", ".yml")):
             files_to_process.append(file_content)
 
     if not files_to_process:
-        print("No file YAML found.")
+        print("No YAML files found.")
         return
-
-    try:
-        repo.get_git_ref(f"heads/{BRANCH_NAME}")
-        print(f"Branch '{BRANCH_NAME}' already exist.")
-    except GithubException:
-        source_ref = repo.get_git_ref(f"heads/{default_branch}")
-        repo.create_git_ref(ref=f"refs/heads/{BRANCH_NAME}", sha=source_ref.object.sha)
-        print(f"Branch '{BRANCH_NAME}' created succesfully.")
 
     updated_any = False
 
+    # 3. Process each file always retrieving the correct SHA from the target branch
     for file_info in files_to_process:
-        decoded_content = file_info.decoded_content.decode("utf-8")
+        # If the branch already existed, make sure to read the file and the most recent SHA from the target branch
+        if branch_exists:
+            try:
+                target_file_info = repo.get_contents(file_info.path, ref=BRANCH_NAME)
+            except GithubException:
+                target_file_info = file_info
+        else:
+            target_file_info = file_info
+
+        decoded_content = target_file_info.decoded_content.decode("utf-8")
         new_content = None
         is_modified = False
 
-        if file_info.name.lower() == "chart.yaml":
+        if target_file_info.name.lower() == "chart.yaml":
             new_content, is_modified = process_chart_yaml(decoded_content)
         else:
             new_content, is_modified = process_values_yaml(decoded_content, domain)
 
         if is_modified:
-            print(f"Modified: {file_info.path}")
+            print(f"Update/Modification applied to: {target_file_info.path}")
             repo.update_file(
-                path=file_info.path,
-                message=f"{COMMIT_MESSAGE} on {file_info.name}",
+                path=target_file_info.path,
+                message=f"{COMMIT_MESSAGE} on {target_file_info.name}",
                 content=new_content,
-                sha=file_info.sha,
+                sha=target_file_info.sha,  # Insert the correct SHA from the target branch
                 branch=BRANCH_NAME
             )
             updated_any = True
+        else:
+            print(f"File already updated / no changes for: {target_file_info.path}")
 
-    if updated_any:
-        try:
+    # 4. Check or create the Pull Request
+    try:
+        prs = repo.get_pulls(state="open", head=f"{repo.owner.login}:{BRANCH_NAME}")
+        if prs.totalCount > 0:
+            pr = prs[0]
+            if updated_any:
+                print(f"SUCCESS: PR #{pr.number} updated with new commits -> {pr.html_url}")
+            else:
+                print(f"Info: PR #{pr.number} is already open and up-to-date -> {pr.html_url}")
+        else:
+            # Create the PR only if the branch has modifications or if for some reason it was missing
             pr = repo.create_pull(
                 title=PR_TITLE,
                 body=PR_BODY,
                 head=BRANCH_NAME,
                 base=default_branch
             )
-            print(f"SUCCESS: Pull Request created -> {pr.html_url}")
-            pr_elaborated["total"] += 1
-            pr_elaborated["pr_links"].append(pr.html_url)
-        except GithubException as e:
-            if "A pull request already exists" in str(e):
-                print("INFO: The Pull Request already exist.")
-            else:
-                print(f"ERROR Creating PR: {e}")
-    else:
-        print("No change is necessary.")
+            print(f"SUCCESS: New Pull Request created -> {pr.html_url}")
+        pr_elaborated["total"] += 1
+        pr_elaborated["pr_links"].append(pr.html_url)
+    except GithubException as e:
+        print(f"Info/Error managing PR: {e}")
 
 
 def main():
@@ -238,8 +260,8 @@ def main():
     for repo_info in REPOSITORIES:
         process_repository(gh, repo_info["name"], repo_info["domain"], pr_elaborated)
 
-    print(f"Total elaborated {pr_elaborated['total']}")
-    print(f"PR created: {pr_elaborated['pr_links']}")
+    print(f"Total: {pr_elaborated['total']}")
+    print(f"PR: {pr_elaborated['pr_links']}")
 
 
 if __name__ == "__main__":
