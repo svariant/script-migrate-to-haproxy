@@ -77,8 +77,8 @@ def process_chart_yaml(content_str):
     modified = False
     for dep in data["dependencies"]:
         if isinstance(dep, dict) and dep.get("name") == "microservice-chart":
-            if dep.get("version") != "8.8.0":
-                dep["version"] = "8.8.0"
+            if dep.get("version") != "8.8.1":
+                dep["version"] = "8.8.1"
                 modified = True
 
     if modified:
@@ -121,27 +121,39 @@ def process_values_yaml(content_str, domain):
     root_key = next(iter(data)) if len(data) == 1 else None
     chart_data = data[root_key] if root_key and isinstance(data[root_key], dict) else data
 
-    if "ingress" not in chart_data or not isinstance(chart_data["ingress"], dict):
+    modified = False
+
+    # 1. Update Ingress / HAProxy
+    if "ingress" in chart_data and isinstance(chart_data["ingress"], dict):
+        ingress_dict = chart_data["ingress"]
+        ingress_path = ingress_dict.get("path", "")
+        base_path = extract_base_path(ingress_path)
+
+        haproxy_config = {
+            "create": True,
+            "host": "haproxy."+domain+".internal.platform.pagopa.it",
+            "path": base_path,
+            "rewriteTarget": DoubleQuotedScalarString(r"/\1")
+        }
+
+        if ingress_dict.get("haproxy") != haproxy_config:
+            ingress_dict["haproxy"] = haproxy_config
+            modified = True
+
+    # 2. Fix KEDA Autoscaling: Move 'type' to 'metricType' in metadata
+    autoscaling = chart_data.get("autoscaling", {})
+    if isinstance(autoscaling, dict) and autoscaling.get("enable"):
+        triggers = autoscaling.get("triggers", [])
+        if isinstance(triggers, list):
+            for trigger in triggers:
+                if isinstance(trigger, dict) and "metadata" in trigger:
+                    metadata = trigger["metadata"]
+                    if isinstance(metadata, dict) and "type" in metadata:
+                        metadata["metricType"] = metadata.pop("type")
+                        modified = True
+
+    if not modified:
         return None, False
-
-    ingress_dict = chart_data["ingress"]
-    ingress_path = ingress_dict.get("path", "")
-    base_path = extract_base_path(ingress_path)
-
-    # Configure haproxy block
-    haproxy_config = {
-        "create": True,
-        "host": "haproxy."+domain+".internal.platform.pagopa.it",
-        "path": base_path,
-        "rewriteTarget": DoubleQuotedScalarString(r"/\1")
-    }
-
-    # Check if ingress.haproxy is already configured
-    if ingress_dict.get("haproxy") == haproxy_config:
-        return None, False
-
-    # Add/update haproxy block under ingress
-    ingress_dict["haproxy"] = haproxy_config
 
     stream = StringIO()
     yaml_parser.dump(data, stream)
