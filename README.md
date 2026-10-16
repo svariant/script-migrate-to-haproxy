@@ -5,5 +5,5 @@ Needed:
 - GITHUB_TOKEN env
 - python3
 - ruamel.yaml
-//pip install PyGithub ruamel.yaml
+`pip install PyGithub ruamel.yaml`
 
