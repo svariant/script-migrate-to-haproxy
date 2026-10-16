@@ -149,7 +149,10 @@ def process_values_yaml(content_str, domain):
                 if isinstance(trigger, dict) and "metadata" in trigger:
                     metadata = trigger["metadata"]
                     if isinstance(metadata, dict) and "type" in metadata:
-                        metadata["metricType"] = metadata.pop("type")
+                        trigger["metricType"] = metadata.pop("type")
+                        modified = True
+                    else:
+                        trigger["metricType"] = "Utilization"
                         modified = True
 
     if not modified:
