@@ -295,23 +295,14 @@ def process_values_yaml(content_str, domain=None):
         child_indent = " " * (block["indent"] + 2)
         grandchild_indent = " " * (block["indent"] + 4)
 
-        # YAML double quoted:
-        # il backslash deve essere escapato.
-        yaml_rewrite_target = rewrite_target.replace(
-            "\\",
-            "\\\\",
-        )
-
         block_text = (
             f"{child_indent}haproxy:\n"
             f"{grandchild_indent}create: true\n"
             f'{grandchild_indent}host: "{host}"\n'
             f'{grandchild_indent}path: "{haproxy_path}"\n'
-            f'{grandchild_indent}'
-            f'rewriteTarget: "{yaml_rewrite_target}"\n'
+            f'{grandchild_indent}rewriteTarget: "{rewrite_target}"\n'
             f"{grandchild_indent}annotations:\n"
-            f'{grandchild_indent}'
-            f'  haproxy.org/check: "true"\n'
+            f'{grandchild_indent}  haproxy.org/check: "true"\n'
         )
 
         insertions.append(
