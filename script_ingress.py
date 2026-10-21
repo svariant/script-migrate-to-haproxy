@@ -104,79 +104,235 @@ def process_chart_yaml(content_str, domain=None):
     return None, False
 
 
-def extract_base_path(full_path):
-    """
-    Extract path from ingress and clean it
-    Es: '/pagopa-anonymizer/(.*)' -> '/pagopa-anonymizer/'
-        '/pagopa-api-config-core-service/p/(.*)' -> '/pagopa-api-config-core-service/p/'
-    """
+def extract_haproxy_path(full_path):
     if not full_path:
-        return "/"
-    
-    clean_path = re.sub(r"\((\.\*|\.\+)\)\s*$", "", str(full_path).strip())
-    return clean_path if clean_path.endswith("/") else f"{clean_path}/"
+        return "/", "/"
+
+    full_path = str(full_path).strip()
+
+    # Rimuove il pattern regex Nginx finale "(.*)"
+    # dal path utilizzato da HAProxy.
+    if full_path.endswith("(.*)"):
+        haproxy_path = full_path[:-4]
+
+        if not haproxy_path.endswith("/"):
+            haproxy_path += "/"
+
+        return haproxy_path, "/"
+
+    return full_path, "/"
 
 
-def process_values_yaml(content_str, domain):
+def process_values_yaml(content_str, domain=None):
     """
-    Add haproxy block under ingress
-    """
-    yaml_parser = get_yaml_parser()
-    data = yaml_parser.load(content_str)
+    Aggiunge HAProxy solamente agli ingress che dichiarano
+    esplicitamente un path.
 
-    if not isinstance(data, dict):
+    Non modifica:
+      - canaryDelivery.ingress
+      - ingress base usato come anchor (&ingress)
+      - ingress senza path
+      - ingress che hanno già haproxy
+    """
+
+    lines = content_str.splitlines(keepends=True)
+
+    blocks = []
+
+    # -------------------------------------------------------
+    # 1. Individua tutti i blocchi "ingress:"
+    # -------------------------------------------------------
+    for i, line in enumerate(lines):
+
+        match = re.match(
+            r"^(\s*)ingress:\s*(?:&[A-Za-z0-9_-]+)?\s*(?:#.*)?(?:\r?\n)?$",
+            line,
+        )
+
+        if not match:
+            continue
+
+        indent = len(match.group(1))
+
+        # Trova la fine del blocco ingress
+        end = len(lines)
+
+        for j in range(i + 1, len(lines)):
+
+            current = lines[j]
+
+            if not current.strip():
+                continue
+
+            if current.lstrip().startswith("#"):
+                continue
+
+            current_indent = len(current) - len(current.lstrip(" "))
+
+            if current_indent <= indent:
+                end = j
+                break
+
+        blocks.append(
+            {
+                "start": i,
+                "end": end,
+                "indent": indent,
+            }
+        )
+
+    if not blocks:
+        print("WARN: nessun ingress trovato")
         return None, False
 
-    # Identity primary key (es. microservice-chart) or use root dictionary
-    root_key = next(iter(data)) if len(data) == 1 else None
-    chart_data = data[root_key] if root_key and isinstance(data[root_key], dict) else data
+    # -------------------------------------------------------
+    # 2. Recupera host comune dall'anchor &ingress
+    # -------------------------------------------------------
 
-    modified = False
+    common_host = None
 
-    # 1. Update Ingress / HAProxy
-    if "ingress" in chart_data and isinstance(chart_data["ingress"], dict):
-        ingress_dict = chart_data["ingress"]
-        ingress_path = ingress_dict.get("path", "")
-        base_path = extract_base_path(ingress_path)
+    for block in blocks:
 
-        haproxy_host = ingress_dict.get("host")
-        if not haproxy_host:
-            print("WARN: nessun host trovato nell'ingress, blocco haproxy non aggiunto")
-            return None, False
+        ingress_line = lines[block["start"]]
 
-        haproxy_config = {
-            "create": True,
-            "host": haproxy_host,
-            "path": base_path,
-            "rewriteTarget": DoubleQuotedScalarString(r"/\1")
-        }
+        # Ci interessa in particolare:
+        #
+        # ingress: &ingress
+        #
+        if "&ingress" not in ingress_line:
+            continue
 
-        if ingress_dict.get("haproxy") != haproxy_config:
-            ingress_dict["haproxy"] = haproxy_config
-            modified = True
+        body = "".join(
+            lines[
+                block["start"] + 1:
+                block["end"]
+            ]
+        )
 
-    # 2. Fix KEDA Autoscaling: Move 'type' to 'metricType' in metadata
-    autoscaling = chart_data.get("autoscaling", {})
-    if isinstance(autoscaling, dict) and autoscaling.get("enable"):
-        triggers = autoscaling.get("triggers", [])
-        if isinstance(triggers, list):
-            for trigger in triggers:
-                if isinstance(trigger, dict) and "metadata" in trigger:
-                    metadata = trigger["metadata"]
-                    if isinstance(metadata, dict) and "type" in metadata:
-                        trigger["metricType"] = metadata.pop("type")
-                        modified = True
-                    else:
-                        trigger["metricType"] = "Utilization"
-                        modified = True
+        host_match = re.search(
+            r'(?m)^\s+host:\s*["\']?([^"\'\r\n#]+)["\']?\s*(?:#.*)?$',
+            body,
+        )
 
-    if not modified:
+        if host_match:
+            common_host = host_match.group(1).strip()
+            break
+
+    # -------------------------------------------------------
+    # 3. Aggiunge HAProxy solamente agli ingress con path
+    # -------------------------------------------------------
+
+    insertions = []
+
+    for block in blocks:
+
+        body = "".join(
+            lines[
+                block["start"] + 1:
+                block["end"]
+            ]
+        )
+
+        # Già configurato
+        if re.search(
+            r"(?m)^\s+haproxy:\s*(?:#.*)?$",
+            body,
+        ):
+            print(
+                f"SKIP: ingress riga "
+                f"{block['start'] + 1}: HAProxy già presente"
+            )
+            continue
+
+        # IMPORTANTE:
+        # deve esserci path esplicito nel blocco corrente.
+        path_match = re.search(
+            r'(?m)^\s+path:\s*["\']?([^"\'\r\n#]+)["\']?\s*(?:#.*)?$',
+            body,
+        )
+
+        if not path_match:
+            print(
+                f"SKIP: ingress riga "
+                f"{block['start'] + 1}: nessun path esplicito"
+            )
+            continue
+
+        path = path_match.group(1).strip()
+
+        # ---------------------------------------------------
+        # Host
+        # ---------------------------------------------------
+
+        host_match = re.search(
+            r'(?m)^\s+host:\s*["\']?([^"\'\r\n#]+)["\']?\s*(?:#.*)?$',
+            body,
+        )
+
+        if host_match:
+            host = host_match.group(1).strip()
+        else:
+            # PostgreSQL usa:
+            #
+            # !!merge <<: *ingress
+            #
+            # quindi eredita l'host dall'anchor.
+            host = common_host
+
+        if not host:
+            print(
+                f"WARN: ingress riga "
+                f"{block['start'] + 1}: host non trovato"
+            )
+            continue
+
+        # ---------------------------------------------------
+        # Conversione path
+        # ---------------------------------------------------
+
+        haproxy_path, rewrite_target = extract_haproxy_path(path)
+
+        child_indent = " " * (block["indent"] + 2)
+        grandchild_indent = " " * (block["indent"] + 4)
+
+        # YAML double quoted:
+        # il backslash deve essere escapato.
+        yaml_rewrite_target = rewrite_target.replace(
+            "\\",
+            "\\\\",
+        )
+
+        block_text = (
+            f"{child_indent}haproxy:\n"
+            f"{grandchild_indent}create: true\n"
+            f'{grandchild_indent}host: "{host}"\n'
+            f'{grandchild_indent}path: "{haproxy_path}"\n'
+            f'{grandchild_indent}'
+            f'rewriteTarget: "{yaml_rewrite_target}"\n'
+            f"{grandchild_indent}annotations:\n"
+            f'{grandchild_indent}'
+            f'  haproxy.org/check: "true"\n'
+        )
+
+        insertions.append(
+            (block["end"], block_text)
+        )
+
+    if not insertions:
         return None, False
 
-    stream = StringIO()
-    yaml_parser.dump(data, stream)
-    return stream.getvalue(), True
+    # -------------------------------------------------------
+    # 4. Inserisci dal basso verso l'alto
+    # -------------------------------------------------------
 
+    for index, text in sorted(
+        insertions,
+        key=lambda x: x[0],
+        reverse=True,
+    ):
+        lines.insert(index, text)
+
+    return "".join(lines), True
 JOBS = [
     {
         "name": "chart",
@@ -193,7 +349,10 @@ JOBS = [
         "commit_message": COMMIT_MESSAGE_2,
         "pr_title": PR_TITLE_2,
         "pr_body": PR_BODY_2,
-        "match_file": lambda name: name.lower() != "chart.yaml",
+        "match_file": lambda name: (
+            name.lower().startswith("values")
+            and name.lower().endswith((".yaml", ".yml"))
+        ),
         "processor": process_values_yaml,
     },
 ]
@@ -222,7 +381,7 @@ def process_repository(gh, repo_name, domain, job, pr_elaborated):
 
     # 2. Retrieve YAML files in the helm/ folder from the target branch (if it exists) or from the main branch
     target_ref = branch_name if branch_exists else default_branch
-    
+
     try:
         helm_contents = repo.get_contents("helm", ref=target_ref)
     except GithubException:
