@@ -1,9 +1,11 @@
 import os
 import sys
+import re
 from io import StringIO
 from github import Github, GithubException
 from ruamel.yaml import YAML
 from ruamel.yaml.scalarstring import DoubleQuotedScalarString
+
 
 # 1. Target repositories
 REPOSITORIES = [
@@ -11,10 +13,9 @@ REPOSITORIES = [
     #{"name": "pagopa/pagopa-anonymizer", "domain": "shared"}
 ]
 
-BRANCH_NAME = "update-ingress-haproxy"
-COMMIT_MESSAGE = "chore: update microservice-chart to 8.8.0 and configure haproxy block"
-PR_TITLE = "chore: Migrate to microservice-chart 8.8.0 and configure HAProxy"
-PR_BODY = """<!--- Please always add a PR description as if nobody knows anything about the context these changes come from. -->
+CHART_VERSION = "8.8.2"
+
+PR_BODY_HEADER = """<!--- Please always add a PR description as if nobody knows anything about the context these changes come from. -->
 <!--- Even if we are all from our internal team, we may not be on the same page. -->
 <!--- Write this PR as you were contributing to a public OSS project, where nobody knows you and you have to earn their trust. -->
 <!--- This will improve our projects in the long run! Thanks. -->
@@ -22,9 +23,9 @@ PR_BODY = """<!--- Please always add a PR description as if nobody knows anythin
 #### List of Changes
 
 <!--- Describe your changes in detail -->
-- Migrate ingress from nginx to HAProxy
-- Update microservice-chart to 8.8.0
+"""
 
+PR_BODY_FOOTER = """
 #### Motivation and Context
 
 <!--- Why is this change required? What problem does it solve? -->
@@ -56,6 +57,20 @@ Nginx will be EOL so its needed to migrate to HAProxy
 - [ ] I have updated the documentation accordingly.
 """
 
+# --- PR 1: solo upgrade microservice-chart ---
+BRANCH_NAME_1 = "update-microservice-chart-8-8-2"
+COMMIT_MESSAGE_1 = f"chore: update microservice-chart to {CHART_VERSION}"
+PR_TITLE_1 = f"chore: Update microservice-chart to {CHART_VERSION}"
+PR_BODY_1 = PR_BODY_HEADER + f"- Update microservice-chart to {CHART_VERSION}\n" + PR_BODY_FOOTER
+
+# --- PR 2: solo blocco haproxy ---
+BRANCH_NAME_2 = "update-ingress-haproxy"
+COMMIT_MESSAGE_2 = "chore: configure haproxy block"
+PR_TITLE_2 = "chore: Configure HAProxy ingress"
+PR_BODY_2 = PR_BODY_HEADER + "- Migrate ingress from nginx to HAProxy (add haproxy block)\n" + PR_BODY_FOOTER
+
+
+
 
 def get_yaml_parser():
     yaml = YAML()
@@ -64,9 +79,9 @@ def get_yaml_parser():
     return yaml
 
 
-def process_chart_yaml(content_str):
+def process_chart_yaml(content_str, domain=None):
     """
-    Update microservice-chart version to 8.8.0 in Chart.yaml
+    Update microservice-chart version to 8.8.2 in Chart.yaml
     """
     yaml_parser = get_yaml_parser()
     data = yaml_parser.load(content_str)
@@ -77,8 +92,8 @@ def process_chart_yaml(content_str):
     modified = False
     for dep in data["dependencies"]:
         if isinstance(dep, dict) and dep.get("name") == "microservice-chart":
-            if dep.get("version") != "8.8.1":
-                dep["version"] = "8.8.1"
+            if dep.get("version") != CHART_VERSION:
+                dep["version"] = CHART_VERSION
                 modified = True
 
     if modified:
@@ -93,17 +108,12 @@ def extract_base_path(full_path):
     """
     Extract path from ingress and clean it
     Es: '/pagopa-anonymizer/(.*)' -> '/pagopa-anonymizer/'
+        '/pagopa-api-config-core-service/p/(.*)' -> '/pagopa-api-config-core-service/p/'
     """
     if not full_path:
         return "/"
     
-    clean_path = str(full_path).strip()
-    parts = clean_path.split("/")
-    
-    # Prende la prima parte dopo la radice e assicura lo slash finale
-    if len(parts) >= 2 and parts[1]:
-        return f"/{parts[1]}/"
-    
+    clean_path = re.sub(r"\((\.\*|\.\+)\)\s*$", "", str(full_path).strip())
     return clean_path if clean_path.endswith("/") else f"{clean_path}/"
 
 
@@ -129,9 +139,14 @@ def process_values_yaml(content_str, domain):
         ingress_path = ingress_dict.get("path", "")
         base_path = extract_base_path(ingress_path)
 
+        haproxy_host = ingress_dict.get("host")
+        if not haproxy_host:
+            print("WARN: nessun host trovato nell'ingress, blocco haproxy non aggiunto")
+            return None, False
+
         haproxy_config = {
             "create": True,
-            "host": "haproxy."+domain+".internal.platform.pagopa.it",
+            "host": haproxy_host,
             "path": base_path,
             "rewriteTarget": DoubleQuotedScalarString(r"/\1")
         }
@@ -162,8 +177,30 @@ def process_values_yaml(content_str, domain):
     yaml_parser.dump(data, stream)
     return stream.getvalue(), True
 
-def process_repository(gh, repo_name, domain, pr_elaborated):
-    print(f"\n---> Modifing Repo: {repo_name}")
+JOBS = [
+    {
+        "name": "chart",
+        "branch": BRANCH_NAME_1,
+        "commit_message": COMMIT_MESSAGE_1,
+        "pr_title": PR_TITLE_1,
+        "pr_body": PR_BODY_1,
+        "match_file": lambda name: name.lower() == "chart.yaml",
+        "processor": process_chart_yaml,
+    },
+    {
+        "name": "haproxy",
+        "branch": BRANCH_NAME_2,
+        "commit_message": COMMIT_MESSAGE_2,
+        "pr_title": PR_TITLE_2,
+        "pr_body": PR_BODY_2,
+        "match_file": lambda name: name.lower() != "chart.yaml",
+        "processor": process_values_yaml,
+    },
+]
+
+def process_repository(gh, repo_name, domain, job, pr_elaborated):
+    branch_name = job["branch"]
+    print(f"\n---> [{job['name']}] Modifing Repo: {repo_name} - ")
     try:
         repo = gh.get_repo(repo_name)
     except GithubException as e:
@@ -175,16 +212,16 @@ def process_repository(gh, repo_name, domain, pr_elaborated):
     # 1. Check/Create the dedicated branch
     branch_exists = False
     try:
-        repo.get_git_ref(f"heads/{BRANCH_NAME}")
+        repo.get_git_ref(f"heads/{branch_name}")
         branch_exists = True
-        print(f"The branch '{BRANCH_NAME}' already exists. It will be checked and possibly updated.")
+        print(f"The branch '{branch_name}' already exists. It will be checked and possibly updated.")
     except GithubException:
         source_ref = repo.get_git_ref(f"heads/{default_branch}")
-        repo.create_git_ref(ref=f"refs/heads/{BRANCH_NAME}", sha=source_ref.object.sha)
-        print(f"Branch '{BRANCH_NAME}' created successfully.")
+        repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=source_ref.object.sha)
+        print(f"Branch '{branch_name}' created successfully.")
 
     # 2. Retrieve YAML files in the helm/ folder from the target branch (if it exists) or from the main branch
-    target_ref = BRANCH_NAME if branch_exists else default_branch
+    target_ref = branch_name if branch_exists else default_branch
     
     try:
         helm_contents = repo.get_contents("helm", ref=target_ref)
@@ -197,7 +234,7 @@ def process_repository(gh, repo_name, domain, pr_elaborated):
         file_content = helm_contents.pop(0)
         if file_content.type == "dir":
             helm_contents.extend(repo.get_contents(file_content.path, ref=target_ref))
-        elif file_content.name.endswith((".yaml", ".yml")):
+        elif file_content.name.endswith((".yaml", ".yml")) and job["match_file"](file_content.name):
             files_to_process.append(file_content)
 
     if not files_to_process:
@@ -211,29 +248,23 @@ def process_repository(gh, repo_name, domain, pr_elaborated):
         # If the branch already existed, make sure to read the file and the most recent SHA from the target branch
         if branch_exists:
             try:
-                target_file_info = repo.get_contents(file_info.path, ref=BRANCH_NAME)
+                target_file_info = repo.get_contents(file_info.path, ref=branch_name)
             except GithubException:
                 target_file_info = file_info
         else:
             target_file_info = file_info
 
         decoded_content = target_file_info.decoded_content.decode("utf-8")
-        new_content = None
-        is_modified = False
-
-        if target_file_info.name.lower() == "chart.yaml":
-            new_content, is_modified = process_chart_yaml(decoded_content)
-        else:
-            new_content, is_modified = process_values_yaml(decoded_content, domain)
+        new_content, is_modified = job["processor"](decoded_content, domain)
 
         if is_modified:
             print(f"Update/Modification applied to: {target_file_info.path}")
             repo.update_file(
                 path=target_file_info.path,
-                message=f"{COMMIT_MESSAGE} on {target_file_info.name}",
+                message=f"{job['commit_message']} on {target_file_info.name}",
                 content=new_content,
                 sha=target_file_info.sha,  # Insert the correct SHA from the target branch
-                branch=BRANCH_NAME
+                branch=branch_name
             )
             updated_any = True
         else:
@@ -241,7 +272,7 @@ def process_repository(gh, repo_name, domain, pr_elaborated):
 
     # 4. Check or create the Pull Request
     try:
-        prs = repo.get_pulls(state="open", head=f"{repo.owner.login}:{BRANCH_NAME}")
+        prs = repo.get_pulls(state="open", head=f"{repo.owner.login}:{branch_name}")
         if prs.totalCount > 0:
             pr = prs[0]
             if updated_any:
@@ -251,9 +282,9 @@ def process_repository(gh, repo_name, domain, pr_elaborated):
         else:
             # Create the PR only if the branch has modifications or if for some reason it was missing
             pr = repo.create_pull(
-                title=PR_TITLE,
-                body=PR_BODY,
-                head=BRANCH_NAME,
+                title=job["pr_title"],
+                body=job["pr_body"],
+                head=branch_name,
                 base=default_branch
             )
             print(f"SUCCESS: New Pull Request created -> {pr.html_url}")
@@ -273,7 +304,8 @@ def main():
 
     pr_elaborated = {"total": 0, "pr_links": []}
     for repo_info in REPOSITORIES:
-        process_repository(gh, repo_info["name"], repo_info["domain"], pr_elaborated)
+        for job in JOBS:
+            process_repository(gh, repo_info["name"], repo_info["domain"], job, pr_elaborated)
 
     print(f"Total: {pr_elaborated['total']}")
     print(f"PR: {pr_elaborated['pr_links']}")
