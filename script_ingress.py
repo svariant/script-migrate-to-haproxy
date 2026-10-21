@@ -15,6 +15,8 @@ REPOSITORIES = [
 
 CHART_VERSION = "8.8.2"
 
+TASK="PIDM-2502" 
+
 PR_BODY_HEADER = """<!--- Please always add a PR description as if nobody knows anything about the context these changes come from. -->
 <!--- Even if we are all from our internal team, we may not be on the same page. -->
 <!--- Write this PR as you were contributing to a public OSS project, where nobody knows you and you have to earn their trust. -->
@@ -25,11 +27,11 @@ PR_BODY_HEADER = """<!--- Please always add a PR description as if nobody knows 
 <!--- Describe your changes in detail -->
 """
 
-PR_BODY_FOOTER = """
+PR_BODY_FOOTER = f"""
 #### Motivation and Context
 
 <!--- Why is this change required? What problem does it solve? -->
-[PIDM-2501](https://pagopa.atlassian.net/browse/PIDM-2501)
+[{TASK}](https://pagopa.atlassian.net/browse/{TASK})
 Nginx will be EOL so its needed to migrate to HAProxy
 
 #### How Has This Been Tested?
@@ -58,15 +60,15 @@ Nginx will be EOL so its needed to migrate to HAProxy
 """
 
 # --- PR 1: solo upgrade microservice-chart ---
-BRANCH_NAME_1 = "update-microservice-chart-8-8-2"
+BRANCH_NAME_1 = f"{TASK}-update-microservice-chart-8-8-2"
 COMMIT_MESSAGE_1 = f"chore: update microservice-chart to {CHART_VERSION}"
-PR_TITLE_1 = f"chore: Update microservice-chart to {CHART_VERSION}"
+PR_TITLE_1 = f"[{TASK}] chore: Update microservice-chart to {CHART_VERSION}"
 PR_BODY_1 = PR_BODY_HEADER + f"- Update microservice-chart to {CHART_VERSION}\n" + PR_BODY_FOOTER
 
 # --- PR 2: solo blocco haproxy ---
-BRANCH_NAME_2 = "update-ingress-haproxy"
+BRANCH_NAME_2 = f"{TASK}-update-ingress-haproxy"
 COMMIT_MESSAGE_2 = "chore: configure haproxy block"
-PR_TITLE_2 = "chore: Configure HAProxy ingress"
+PR_TITLE_2 = f"[{TASK}] chore: Configure HAProxy ingress"
 PR_BODY_2 = PR_BODY_HEADER + "- Migrate ingress from nginx to HAProxy (add haproxy block)\n" + PR_BODY_FOOTER
 
 
