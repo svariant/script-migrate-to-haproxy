@@ -10,7 +10,7 @@ from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 # 1. Target repositories
 REPOSITORIES = [
     # Add here the repos to modify...
-    #{"name": "pagopa/pagopa-anonymizer", "domain": "shared"}
+    {"name": "pagopa/pagopa-anonymizer", "domain": "shared"}
 ]
 
 CHART_VERSION = "8.8.2"
