@@ -60,41 +60,24 @@ Nginx will be EOL so its needed to migrate to HAProxy.
 
 
 # ============================================================
-# PR 1 - CHART + KEDA
+# SINGLE PR - CHART + KEDA + HAPROXY
 # ============================================================
 
-BRANCH_NAME_1 = f"{TASK}-update-microservice-chart-8-8-2"
+BRANCH_NAME = f"{TASK}-migrate-haproxy"
 
-COMMIT_MESSAGE_1 = (
-    f"chore: update microservice-chart to {CHART_VERSION}"
+COMMIT_MESSAGE = (
+    f"chore: migrate ingress to HAProxy and update "
+    f"microservice-chart to {CHART_VERSION}"
 )
 
-PR_TITLE_1 = (
-    f"[{TASK}] chore: Update microservice-chart to {CHART_VERSION}"
+PR_TITLE = (
+    f"[{TASK}] chore: Migrate ingress to HAProxy"
 )
 
-PR_BODY_1 = (
+PR_BODY = (
     PR_BODY_HEADER
     + f"- Update microservice-chart to {CHART_VERSION}\n"
     + "- Move KEDA metadata.type to trigger metricType\n"
-    + PR_BODY_FOOTER
-)
-
-
-# ============================================================
-# PR 2 - HAPROXY
-# ============================================================
-
-BRANCH_NAME_2 = f"{TASK}-update-ingress-haproxy"
-
-COMMIT_MESSAGE_2 = "chore: configure haproxy block"
-
-PR_TITLE_2 = (
-    f"[{TASK}] chore: Configure HAProxy ingress"
-)
-
-PR_BODY_2 = (
-    PR_BODY_HEADER
     + "- Migrate ingress from nginx to HAProxy (add haproxy block)\n"
     + PR_BODY_FOOTER
 )
@@ -393,21 +376,59 @@ def process_keda_values_yaml(content_str):
 
 
 # ============================================================
-# CHART JOB
+# FILE PROCESSOR
 # ============================================================
 
-def process_chart_job(content_str, filename):
+def process_file(content_str, filename):
 
     filename_lower = filename.lower()
 
+    # --------------------------------------------------------
+    # Chart.yaml
+    # --------------------------------------------------------
+
     if filename_lower == "chart.yaml":
         return process_chart_yaml(content_str)
+
+    # --------------------------------------------------------
+    # values*.yaml
+    #
+    # Sullo stesso file vengono applicate in sequenza:
+    #   1. migrazione KEDA
+    #   2. configurazione HAProxy
+    # --------------------------------------------------------
 
     if (
         filename_lower.startswith("values")
         and filename_lower.endswith((".yaml", ".yml"))
     ):
-        return process_keda_values_yaml(content_str)
+
+        current_content = content_str
+        modified = False
+
+        # KEDA
+        new_content, keda_modified = (
+            process_keda_values_yaml(current_content)
+        )
+
+        if keda_modified:
+            current_content = new_content
+            modified = True
+
+        # HAProxy
+        new_content, haproxy_modified = (
+            process_values_yaml(
+                current_content,
+                filename,
+            )
+        )
+
+        if haproxy_modified:
+            current_content = new_content
+            modified = True
+
+        if modified:
+            return current_content, True
 
     return None, False
 
@@ -689,67 +710,19 @@ def process_values_yaml(content_str, filename=None):
 
 
 # ============================================================
-# JOBS
-# ============================================================
-
-JOBS = [
-    {
-        "name": "chart",
-        "branch": BRANCH_NAME_1,
-        "commit_message": COMMIT_MESSAGE_1,
-        "pr_title": PR_TITLE_1,
-        "pr_body": PR_BODY_1,
-
-        # PR 1 deve controllare sia Chart.yaml
-        # sia i values per la migrazione KEDA.
-        "match_file": lambda name: (
-            name.lower() == "chart.yaml"
-            or (
-                name.lower().startswith("values")
-                and name.lower().endswith(
-                    (".yaml", ".yml")
-                )
-            )
-        ),
-
-        "processor": process_chart_job,
-    },
-
-    {
-        "name": "haproxy",
-        "branch": BRANCH_NAME_2,
-        "commit_message": COMMIT_MESSAGE_2,
-        "pr_title": PR_TITLE_2,
-        "pr_body": PR_BODY_2,
-
-        "match_file": lambda name: (
-            name.lower().startswith("values")
-            and name.lower().endswith(
-                (".yaml", ".yml")
-            )
-        ),
-
-        "processor": process_values_yaml,
-    },
-]
-
-
-# ============================================================
 # REPOSITORY PROCESSING
 # ============================================================
 
 def process_repository(
     gh,
     repo_name,
-    job,
     pr_elaborated,
 ):
 
-    branch_name = job["branch"]
+    branch_name = BRANCH_NAME
 
     print(
-        f"\n---> [{job['name']}] "
-        f"Modifying Repo: {repo_name}"
+        f"\n---> Modifying Repo: {repo_name}"
     )
 
     # --------------------------------------------------------
@@ -760,12 +733,10 @@ def process_repository(
         repo = gh.get_repo(repo_name)
 
     except GithubException as e:
-
         print(
             f"ERROR: Impossible to access repo "
             f"{repo_name}: {e}"
         )
-
         return
 
     default_branch = repo.default_branch
@@ -774,15 +745,10 @@ def process_repository(
     # Branch
     # --------------------------------------------------------
 
-    branch_exists = False
-
     try:
-
         repo.get_git_ref(
             f"heads/{branch_name}"
         )
-
-        branch_exists = True
 
         print(
             f"The branch '{branch_name}' "
@@ -792,18 +758,14 @@ def process_repository(
 
     except GithubException as e:
 
-        # Creiamo la branch solamente se realmente non esiste.
         if e.status != 404:
-
             print(
                 f"ERROR checking branch "
                 f"'{branch_name}': {e}"
             )
-
             return
 
         try:
-
             source_ref = repo.get_git_ref(
                 f"heads/{default_branch}"
             )
@@ -819,42 +781,28 @@ def process_repository(
             )
 
         except GithubException as create_error:
-
             print(
                 f"ERROR creating branch "
                 f"'{branch_name}': "
                 f"{create_error}"
             )
-
             return
-
-    # --------------------------------------------------------
-    # IMPORTANTE:
-    #
-    # La branch, anche appena creata, è il riferimento
-    # su cui dobbiamo leggere e scrivere.
-    # --------------------------------------------------------
-
-    target_ref = branch_name
 
     # --------------------------------------------------------
     # Helm files
     # --------------------------------------------------------
 
     try:
-
         helm_contents = repo.get_contents(
             "helm",
-            ref=target_ref,
+            ref=branch_name,
         )
 
     except GithubException:
-
         print(
             f"WARN: Folder 'helm/' not found "
             f"in {repo_name}. Skipping."
         )
-
         return
 
     files_to_process = []
@@ -868,30 +816,27 @@ def process_repository(
             helm_contents.extend(
                 repo.get_contents(
                     file_content.path,
-                    ref=target_ref,
+                    ref=branch_name,
                 )
             )
 
         elif (
-            file_content.name.lower().endswith(
-                (".yaml", ".yml")
-            )
-            and job["match_file"](
-                file_content.name
+            file_content.name.lower() == "chart.yaml"
+            or (
+                file_content.name.lower().startswith("values")
+                and file_content.name.lower().endswith(
+                    (".yaml", ".yml")
+                )
             )
         ):
-
             files_to_process.append(
                 file_content
             )
 
     if not files_to_process:
-
         print(
-            f"No YAML files found for "
-            f"job '{job['name']}'."
+            "No Chart.yaml or values*.yaml files found."
         )
-
         return
 
     updated_any = False
@@ -903,22 +848,17 @@ def process_repository(
     for file_info in files_to_process:
 
         try:
-
-            # Recuperiamo sempre la versione più recente
-            # dalla branch target.
             target_file_info = repo.get_contents(
                 file_info.path,
                 ref=branch_name,
             )
 
         except GithubException as e:
-
             print(
                 f"WARN: impossibile leggere "
                 f"{file_info.path} "
                 f"dalla branch {branch_name}: {e}"
             )
-
             continue
 
         decoded_content = (
@@ -928,20 +868,18 @@ def process_repository(
         )
 
         new_content, is_modified = (
-            job["processor"](
+            process_file(
                 decoded_content,
                 target_file_info.name,
             )
         )
 
         if not is_modified:
-
             print(
                 f"File already updated / "
                 f"no changes for: "
                 f"{target_file_info.path}"
             )
-
             continue
 
         print(
@@ -950,11 +888,10 @@ def process_repository(
         )
 
         try:
-
             repo.update_file(
                 path=target_file_info.path,
                 message=(
-                    f"{job['commit_message']} "
+                    f"{COMMIT_MESSAGE} "
                     f"on {target_file_info.name}"
                 ),
                 content=new_content,
@@ -965,7 +902,6 @@ def process_repository(
             updated_any = True
 
         except GithubException as e:
-
             print(
                 f"ERROR updating "
                 f"{target_file_info.path}: {e}"
@@ -991,7 +927,6 @@ def process_repository(
             pr = prs[0]
 
             if updated_any:
-
                 print(
                     f"SUCCESS: PR #{pr.number} "
                     f"updated with new commits -> "
@@ -999,7 +934,6 @@ def process_repository(
                 )
 
             else:
-
                 print(
                     f"Info: PR #{pr.number} "
                     f"is already open and "
@@ -1018,9 +952,7 @@ def process_repository(
 
         # ----------------------------------------------------
         # Nessuna PR aperta.
-        #
-        # Controlliamo se la branch ha veramente commit
-        # diversi da main.
+        # Controlliamo se la branch è diversa da main.
         # ----------------------------------------------------
 
         comparison = repo.compare(
@@ -1031,8 +963,7 @@ def process_repository(
         if comparison.ahead_by == 0:
 
             print(
-                f"Info: job '{job['name']}': "
-                f"nessuna differenza tra "
+                f"Info: nessuna differenza tra "
                 f"'{branch_name}' e "
                 f"'{default_branch}'. "
                 f"PR non necessaria."
@@ -1045,8 +976,8 @@ def process_repository(
         # ----------------------------------------------------
 
         pr = repo.create_pull(
-            title=job["pr_title"],
-            body=job["pr_body"],
+            title=PR_TITLE,
+            body=PR_BODY,
             head=branch_name,
             base=default_branch,
         )
@@ -1062,11 +993,9 @@ def process_repository(
         )
 
     except GithubException as e:
-
         print(
             f"Info/Error managing PR: {e}"
         )
-
 
 # ============================================================
 # MAIN
@@ -1097,14 +1026,11 @@ def main():
 
     for repo_info in REPOSITORIES:
 
-        for job in JOBS:
-
-            process_repository(
-                gh,
-                repo_info["name"],
-                job,
-                pr_elaborated,
-            )
+       process_repository(
+           gh,
+           repo_info["name"],
+           pr_elaborated,
+    )
 
     print("\n==============================")
     print("RESULT")
